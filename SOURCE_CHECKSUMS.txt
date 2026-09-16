@@ -1,0 +1,7 @@
+Tested input source (Eingefügter Text(20260916-142821).txt)
+SHA256  e07c4464092fc1bed745588a993d9786da04ebe65dd0b5f3abb061bfc66c9071
+
+Release file (solarflow_ble_controller.yaml)
+SHA256  6bcb6ea76ae99bd0893473bb5415c5ac0ee2d958dacd805582da2f6ecb8fc669
+
+Packaging difference: one comment-only OTA security line; controller logic unchanged.

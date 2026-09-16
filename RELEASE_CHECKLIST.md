@@ -1,0 +1,21 @@
+# V2.0 Release Checklist
+
+- [x] Hardware-tested V2.0 source selected as release base
+- [x] No outgoing `deviceId`
+- [x] No real SolarFlow MAC address in public files
+- [x] No target Wi-Fi SSID/password in public files
+- [x] API encryption key uses `!secret`
+- [x] Captive-portal password uses `!secret`
+- [x] OTA behavior documented consistently with tested configuration
+- [x] Strict YAML parse / duplicate-key check
+- [x] Internal `id(...)` reference check
+- [x] Duplicate exposed entity-name check
+- [x] English primary README
+- [x] Separate German README
+- [x] Protocol, entity, LED and troubleshooting documentation
+- [x] License, disclaimer, notice, security and contributing files
+- [x] CI workflow pinned to ESPHome 2026.8.2
+- [x] SHA-256 checksums generated
+- [ ] Create/push the GitHub repository
+- [ ] Confirm GitHub Actions validation passes
+- [ ] Create GitHub release/tag `V2.0`

@@ -1,0 +1,3706 @@
+# ============================================================
+# SolarFlow BLE Controller V2.0
+#
+# Unofficial ESPHome BLE controller for Zendure SolarFlow.
+# This project is not affiliated with, sponsored by, or endorsed by Zendure.
+#
+# V2.0 protocol behavior:
+# - No legacy per-device identifier is included in protocol payloads.
+# - The initial getAll read uses messageId, timestamp, properties, and method.
+# - Writes use method, timestamp, messageId, and the requested property only.
+# - Supported writes: inputLimit, outputLimit, acMode, socSet, minSoc,
+#   and automatic smartMode=1.
+#
+# Security / provisioning:
+# - ESPHome API encryption key is loaded from secrets.yaml.
+# - ESPHome OTA is enabled without a password; optional hardening is documented in README.md.
+# - No target Wi-Fi SSID or target Wi-Fi password is compiled into firmware.
+# - Wi-Fi is provisioned by the user through the captive portal.
+# - The captive-portal setup AP password is loaded from secrets.yaml.
+#
+# Hardware profile:
+# - ESP32-S3 DevKitC-1
+# - 16 MB flash
+# - ESP-IDF framework
+# - WS2812 status LED on GPIO48
+# - PSRAM is intentionally not enabled.
+#
+# BLE behavior:
+# - Off / On / Scan modes
+# - ZenHA advertisement discovery and device selection
+# - Persistent selected BLE MAC address and address type
+# - BLESPP handshake, getInfo, getAll
+# - Smart Mode readiness gating
+# - 60-second keepalive
+# - reconnect handling and ~30-second CONNECTING watchdog
+# ============================================================
+
+esphome:
+  name: bluetooth-solarflow-ble
+  friendly_name: SolarFlow BLE Controller
+
+  on_boot:
+
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: status_led
+            red: 0%
+            green: 0%
+            blue: 100%
+            brightness: 30%
+            effect: none
+
+    - priority: -100
+      then:
+        - lambda: |-
+            if (
+              id(solarflow_ble_mode) < 0
+              ||
+              id(solarflow_ble_mode) > 2
+            ) {
+              id(solarflow_ble_mode) = 0;
+            }
+
+            if (id(solarflow_ble_mode) == 0) {
+              id(sf_ble_mode_select).publish_state("Off");
+            }
+            else if (id(solarflow_ble_mode) == 1) {
+              id(sf_ble_mode_select).publish_state("On");
+            }
+            else {
+              id(sf_ble_mode_select).publish_state("Scan");
+            }
+
+            id(sf_ble_device_select).publish_state("No selection");
+
+            id(sf_scan_result_1).publish_state("---");
+            id(sf_scan_result_2).publish_state("---");
+            id(sf_scan_result_3).publish_state("---");
+            id(sf_scan_result_4).publish_state("---");
+            id(sf_scan_result_5).publish_state("---");
+
+        - script.execute: solarflow_apply_ble_mode
+
+        - lambda: |-
+            id(solarflow_led_booting) = false;
+
+        - if:
+            condition:
+              wifi.connected:
+
+            then:
+              - script.execute: solarflow_wifi_connected_led_hold
+
+            else:
+              - script.execute: solarflow_update_status_led
+
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+
+  framework:
+    type: esp-idf
+
+
+logger:
+  level: INFO
+
+  logs:
+    esp32_ble_client: INFO
+    esp32_ble_tracker: INFO
+    ble_client: INFO
+    ble_text_sensor: WARN
+    ble_client.automation: INFO
+    light: WARN
+    sensor: WARN
+
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+
+ota:
+  - platform: esphome
+
+# Wi-Fi provisioning
+# -----------------
+# The target Wi-Fi network is intentionally unknown at build time.
+# The user selects the network and enters its password through the captive portal.
+# ESPHome stores the user-entered station credentials persistently.
+#
+wifi:
+
+
+  reboot_timeout: 0s
+
+  ap:
+    ssid: "SolarFlow Wi-Fi Setup"
+    password: !secret wifi_setup_password
+    ap_timeout: 5s
+
+  on_connect:
+    then:
+      - script.execute: solarflow_wifi_connected_led_hold
+
+  on_disconnect:
+    then:
+      - script.stop: solarflow_wifi_connected_led_hold
+
+      - lambda: |-
+          id(solarflow_led_wifi_confirm) = false;
+
+      - script.execute: solarflow_update_status_led
+
+
+captive_portal:
+
+
+esp32_ble:
+  enable_on_boot: false
+
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: false
+
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            if (id(solarflow_ble_mode) != 2) {
+              return;
+            }
+
+            const std::string name = x.get_name();
+
+            const bool is_solarflow =
+              name.rfind("ZenHA", 0) == 0;
+
+            if (!is_solarflow) {
+              return;
+            }
+
+            const uint64_t found_mac =
+              x.address_uint64();
+
+            if (found_mac == 0) {
+              return;
+            }
+
+            const int found_addr_type =
+              static_cast<int>(
+                x.get_address_type()
+              );
+
+            const int found_rssi =
+              x.get_rssi();
+
+            char mac_buf[18];
+
+            x.address_str_to(mac_buf);
+
+            const std::string mac_text =
+              mac_buf;
+
+            int slot = 0;
+            bool is_new = false;
+
+            if (id(solarflow_scan_mac_1) == found_mac) {
+              slot = 1;
+            }
+            else if (id(solarflow_scan_mac_2) == found_mac) {
+              slot = 2;
+            }
+            else if (id(solarflow_scan_mac_3) == found_mac) {
+              slot = 3;
+            }
+            else if (id(solarflow_scan_mac_4) == found_mac) {
+              slot = 4;
+            }
+            else if (id(solarflow_scan_mac_5) == found_mac) {
+              slot = 5;
+            }
+
+            if (slot == 0) {
+              if (id(solarflow_scan_mac_1) == 0) {
+                slot = 1;
+              }
+              else if (id(solarflow_scan_mac_2) == 0) {
+                slot = 2;
+              }
+              else if (id(solarflow_scan_mac_3) == 0) {
+                slot = 3;
+              }
+              else if (id(solarflow_scan_mac_4) == 0) {
+                slot = 4;
+              }
+              else if (id(solarflow_scan_mac_5) == 0) {
+                slot = 5;
+              }
+              else {
+                return;
+              }
+
+              is_new = true;
+            }
+
+            if (!is_new) {
+              int old_rssi = -127;
+
+              if (slot == 1) {
+                old_rssi = id(solarflow_scan_rssi_1);
+              }
+              else if (slot == 2) {
+                old_rssi = id(solarflow_scan_rssi_2);
+              }
+              else if (slot == 3) {
+                old_rssi = id(solarflow_scan_rssi_3);
+              }
+              else if (slot == 4) {
+                old_rssi = id(solarflow_scan_rssi_4);
+              }
+              else if (slot == 5) {
+                old_rssi = id(solarflow_scan_rssi_5);
+              }
+
+              if (found_rssi <= old_rssi) {
+                return;
+              }
+            }
+
+            const std::string result =
+              name
+              + " | "
+              + mac_text
+              + " | "
+              + std::to_string(found_rssi)
+              + " dBm";
+
+            if (slot == 1) {
+              id(solarflow_scan_mac_1) = found_mac;
+              id(solarflow_scan_addr_type_1) = found_addr_type;
+              id(solarflow_scan_rssi_1) = found_rssi;
+              id(sf_scan_result_1).publish_state(result);
+            }
+            else if (slot == 2) {
+              id(solarflow_scan_mac_2) = found_mac;
+              id(solarflow_scan_addr_type_2) = found_addr_type;
+              id(solarflow_scan_rssi_2) = found_rssi;
+              id(sf_scan_result_2).publish_state(result);
+            }
+            else if (slot == 3) {
+              id(solarflow_scan_mac_3) = found_mac;
+              id(solarflow_scan_addr_type_3) = found_addr_type;
+              id(solarflow_scan_rssi_3) = found_rssi;
+              id(sf_scan_result_3).publish_state(result);
+            }
+            else if (slot == 4) {
+              id(solarflow_scan_mac_4) = found_mac;
+              id(solarflow_scan_addr_type_4) = found_addr_type;
+              id(solarflow_scan_rssi_4) = found_rssi;
+              id(sf_scan_result_4).publish_state(result);
+            }
+            else if (slot == 5) {
+              id(solarflow_scan_mac_5) = found_mac;
+              id(solarflow_scan_addr_type_5) = found_addr_type;
+              id(solarflow_scan_rssi_5) = found_rssi;
+              id(sf_scan_result_5).publish_state(result);
+            }
+
+            if (is_new) {
+              ESP_LOGI(
+                "solarflow_scan",
+                "RESULT %d: Name='%s' MAC=%s RSSI=%d dBm",
+                slot,
+                name.c_str(),
+                mac_text.c_str(),
+                found_rssi
+              );
+            }
+            
+globals:
+
+  - id: solarflow_led_booting
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  - id: solarflow_led_wifi_confirm
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_led_error
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+
+  - id: solarflow_ble_mode
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: solarflow_mode_change_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_device_selection_valid
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_selected_mac
+    type: uint64_t
+    restore_value: yes
+    initial_value: "0"
+
+  - id: solarflow_selected_addr_type
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: solarflow_scan_mac_1
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_addr_type_1
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_rssi_1
+    type: int
+    restore_value: no
+    initial_value: "-127"
+
+  - id: solarflow_scan_mac_2
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_addr_type_2
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_rssi_2
+    type: int
+    restore_value: no
+    initial_value: "-127"
+
+  - id: solarflow_scan_mac_3
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_addr_type_3
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_rssi_3
+    type: int
+    restore_value: no
+    initial_value: "-127"
+
+  - id: solarflow_scan_mac_4
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_addr_type_4
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_rssi_4
+    type: int
+    restore_value: no
+    initial_value: "-127"
+
+  - id: solarflow_scan_mac_5
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_addr_type_5
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_scan_rssi_5
+    type: int
+    restore_value: no
+    initial_value: "-127"
+
+  - id: solarflow_ble_is_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_handshake_done
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_getinfo_sent
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_getall_sent
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_protocol_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+
+  - id: cmd_input_limit
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: cmd_output_limit
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: cmd_ac_mode
+    type: int
+    restore_value: no
+    initial_value: "1"
+
+  - id: cmd_max_soc_raw
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+  - id: cmd_min_soc_raw
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+
+  - id: sf_pack_input_power_raw
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: sf_output_pack_power_raw
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+
+  - id: solarflow_smart_mode_value
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+  - id: solarflow_smartmode_seen_packet
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_smartmode_write_pending
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: solarflow_smartmode_last_write_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+
+  - id: solarflow_disconnect_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: solarflow_keepalive_waiting_reply
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+
+select:
+
+  - platform: template
+    id: sf_ble_mode_select
+    name: "SolarFlow Bluetooth Mode"
+    icon: "mdi:bluetooth-settings"
+    options:
+      - "Off"
+      - "On"
+      - "Scan"
+    initial_option: "Off"
+    optimistic: false
+    restore_value: false
+
+    set_action:
+      - lambda: |-
+          if (x == "Off") {
+            id(solarflow_ble_mode) = 0;
+          }
+          else if (x == "On") {
+            id(solarflow_ble_mode) = 1;
+          }
+          else if (x == "Scan") {
+            id(solarflow_ble_mode) = 2;
+          }
+          else {
+            ESP_LOGW(
+              "solarflow_ble_mode",
+              "Unknown Bluetooth mode: %s",
+              x.c_str()
+            );
+            return;
+          }
+
+          id(sf_ble_mode_select).publish_state(x);
+
+          ESP_LOGI(
+            "solarflow_ble_mode",
+            "Bluetooth mode -> %s",
+            x.c_str()
+          );
+
+      - script.stop: solarflow_led_error_hold
+
+      - lambda: |-
+          id(solarflow_led_error) = false;
+
+      - script.execute: solarflow_apply_ble_mode
+
+      - script.execute: solarflow_update_status_led
+
+
+  - platform: template
+    id: sf_ble_device_select
+    name: "SolarFlow BLE Scan Selection"
+    icon: "mdi:bluetooth-connect"
+    options:
+      - "No selection"
+      - "Result 1"
+      - "Result 2"
+      - "Result 3"
+      - "Result 4"
+      - "Result 5"
+    initial_option: "No selection"
+    optimistic: false
+    restore_value: false
+
+    set_action:
+      - lambda: |-
+          id(solarflow_device_selection_valid) = false;
+
+          if (x == "No selection") {
+            id(sf_ble_device_select).publish_state(x);
+            return;
+          }
+
+          uint64_t mac = 0;
+          int addr_type = 0;
+
+          if (x == "Result 1") {
+            mac = id(solarflow_scan_mac_1);
+            addr_type = id(solarflow_scan_addr_type_1);
+          }
+          else if (x == "Result 2") {
+            mac = id(solarflow_scan_mac_2);
+            addr_type = id(solarflow_scan_addr_type_2);
+          }
+          else if (x == "Result 3") {
+            mac = id(solarflow_scan_mac_3);
+            addr_type = id(solarflow_scan_addr_type_3);
+          }
+          else if (x == "Result 4") {
+            mac = id(solarflow_scan_mac_4);
+            addr_type = id(solarflow_scan_addr_type_4);
+          }
+          else if (x == "Result 5") {
+            mac = id(solarflow_scan_mac_5);
+            addr_type = id(solarflow_scan_addr_type_5);
+          }
+
+          if (mac == 0) {
+            ESP_LOGW(
+              "solarflow_select",
+              "%s is empty - selection ignored",
+              x.c_str()
+            );
+            return;
+          }
+
+          id(solarflow_selected_mac) = mac;
+          id(solarflow_selected_addr_type) = addr_type;
+
+          char mac_text[18];
+
+          snprintf(
+            mac_text,
+            sizeof(mac_text),
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            (uint8_t) ((mac >> 40) & 0xFF),
+            (uint8_t) ((mac >> 32) & 0xFF),
+            (uint8_t) ((mac >> 24) & 0xFF),
+            (uint8_t) ((mac >> 16) & 0xFF),
+            (uint8_t) ((mac >> 8) & 0xFF),
+            (uint8_t) (mac & 0xFF)
+          );
+
+          id(sf_selected_mac_text).publish_state(mac_text);
+          id(sf_ble_device_select).publish_state(x);
+
+          id(solarflow_ble_mode) = 1;
+          id(sf_ble_mode_select).publish_state("On");
+
+          id(solarflow_device_selection_valid) = true;
+
+          ESP_LOGI(
+            "solarflow_select",
+            "%s selected -> MAC=%s",
+            x.c_str(),
+            mac_text
+          );
+
+      - if:
+          condition:
+            lambda: |-
+              return id(solarflow_device_selection_valid);
+
+          then:
+            - script.stop: solarflow_led_error_hold
+
+            - lambda: |-
+                id(solarflow_led_error) = false;
+
+            - script.execute: solarflow_apply_ble_mode
+
+            - script.execute: solarflow_update_status_led
+
+
+binary_sensor:
+
+  - platform: template
+    id: sf_ble_connected
+    name: "SolarFlow BLE Connected"
+    icon: "mdi:bluetooth-connect"
+
+
+  - platform: template
+    id: sf_ble_ready
+    name: "SolarFlow BLE Control Ready"
+    icon: "mdi:check-network"
+
+    on_press:
+      then:
+        - script.execute: solarflow_update_status_led
+
+    on_release:
+      then:
+        - script.execute: solarflow_update_status_led
+
+
+  - platform: template
+    id: sf_smart_mode_ok
+    name: "SolarFlow Smart Mode OK"
+    icon: "mdi:check-circle-outline"
+
+
+ble_client:
+
+  - mac_address: "00:00:00:00:00:01"
+
+    id: solarflow_ble
+
+    auto_connect: false
+
+
+    on_connect:
+      then:
+
+        - if:
+            condition:
+              lambda: |-
+                return (
+                  id(solarflow_ble_mode) == 1
+                  &&
+                  !id(solarflow_mode_change_active)
+                  &&
+                  id(solarflow_selected_mac) != 0
+                  &&
+                  id(solarflow_ble).get_address()
+                    == id(solarflow_selected_mac)
+                );
+
+            then:
+              - lambda: |-
+                  id(solarflow_ble_is_connected) = true;
+
+                  id(solarflow_handshake_done) = false;
+                  id(solarflow_getinfo_sent) = false;
+                  id(solarflow_getall_sent) = false;
+
+                  id(solarflow_protocol_ready) = false;
+                  id(solarflow_ready) = false;
+
+                  id(solarflow_smart_mode_value) = -1;
+                  id(solarflow_smartmode_seen_packet) = false;
+                  id(solarflow_smartmode_write_pending) = false;
+                  id(solarflow_smartmode_last_write_ms) = 0;
+
+                  id(solarflow_keepalive_waiting_reply) = false;
+
+                  id(sf_ble_connected).publish_state(true);
+                  id(sf_ble_ready).publish_state(false);
+                  id(sf_smart_mode_ok).publish_state(false);
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "============================================"
+                  );
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "BLE CONNECTED"
+                  );
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "MAC=%s",
+                    id(solarflow_ble).address_str()
+                  );
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "Waiting for BLESPP"
+                  );
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "============================================"
+                  );
+
+              - esp32_ble_tracker.stop_scan:
+
+            else:
+              - lambda: |-
+                  ESP_LOGW(
+                    "solarflow",
+                    "Unexpected BLE connection in mode %d -> disconnecting",
+                    id(solarflow_ble_mode)
+                  );
+
+              - ble_client.disconnect: solarflow_ble
+
+
+    on_disconnect:
+      then:
+
+        - script.stop: solarflow_keepalive_loop
+
+
+        - lambda: |-
+            id(solarflow_ble_is_connected) = false;
+
+            id(solarflow_handshake_done) = false;
+            id(solarflow_getinfo_sent) = false;
+            id(solarflow_getall_sent) = false;
+
+            id(solarflow_protocol_ready) = false;
+            id(solarflow_ready) = false;
+
+            id(solarflow_smartmode_write_pending) = false;
+            id(solarflow_keepalive_waiting_reply) = false;
+
+            if (
+              !id(solarflow_mode_change_active)
+              &&
+              id(solarflow_ble_mode) == 1
+            ) {
+              id(solarflow_disconnect_count)++;
+            }
+
+            id(sf_ble_connected).publish_state(false);
+            id(sf_ble_ready).publish_state(false);
+            id(sf_smart_mode_ok).publish_state(false);
+
+            id(sf_disconnect_count).publish_state(
+              id(solarflow_disconnect_count)
+            );
+
+            ESP_LOGW(
+              "solarflow",
+              "============================================"
+            );
+
+            ESP_LOGW(
+              "solarflow",
+              "BLE DISCONNECTED"
+            );
+
+            ESP_LOGW(
+              "solarflow",
+              "Mode=%d ModeChange=%s Disconnects=%d",
+              id(solarflow_ble_mode),
+              id(solarflow_mode_change_active) ? "YES" : "NO",
+              id(solarflow_disconnect_count)
+            );
+
+            ESP_LOGW(
+              "solarflow",
+              "Keepalive loop stopped"
+            );
+
+            ESP_LOGW(
+              "solarflow",
+              "============================================"
+            );
+
+
+        - delay: 2s
+
+
+        - if:
+            condition:
+              lambda: |-
+                return (
+                  !id(solarflow_mode_change_active)
+                  &&
+                  id(solarflow_ble_mode) == 1
+                  &&
+                  id(solarflow_selected_mac) != 0
+                );
+
+            then:
+              - if:
+                  condition:
+                    not:
+                      ble.enabled:
+
+                  then:
+                    - ble.enable:
+
+                    - wait_until:
+                        condition:
+                          ble.enabled:
+                        timeout: 10s
+
+              - if:
+                  condition:
+                    ble.enabled:
+
+                  then:
+                    - lambda: |-
+                        const uint64_t mac =
+                          id(solarflow_selected_mac);
+
+                        const auto addr_type =
+                          static_cast<esp_ble_addr_type_t>(
+                            id(solarflow_selected_addr_type)
+                          );
+
+                        id(solarflow_ble).set_auto_connect(false);
+                        id(solarflow_ble).set_address(mac);
+                        id(solarflow_ble).set_remote_addr_type(
+                          addr_type
+                        );
+                        id(solarflow_ble).set_auto_connect(true);
+
+                        ESP_LOGI(
+                          "solarflow",
+                          "Reconnect prepared -> MAC=%s",
+                          id(solarflow_ble).address_str()
+                        );
+
+                    - esp32_ble_tracker.start_scan:
+                        continuous: true
+
+
+        - if:
+            condition:
+              lambda: |-
+                return (
+                  !id(solarflow_mode_change_active)
+                  &&
+                  id(solarflow_ble_mode) == 2
+                );
+
+            then:
+              - if:
+                  condition:
+                    not:
+                      ble.enabled:
+
+                  then:
+                    - ble.enable:
+
+                    - wait_until:
+                        condition:
+                          ble.enabled:
+                        timeout: 10s
+
+              - if:
+                  condition:
+                    ble.enabled:
+
+                  then:
+                    - esp32_ble_tracker.start_scan:
+                        continuous: true
+
+
+number:
+
+
+  - platform: template
+
+    id: sf_input_limit
+
+    name: "SolarFlow Input Limit"
+
+    icon: "mdi:battery-arrow-down"
+
+    unit_of_measurement: "W"
+
+    min_value: 0
+    max_value: 2400
+    step: 1
+
+    optimistic: false
+
+
+    set_action:
+
+      - lambda: |-
+
+          int value = (int) x;
+
+          if (value < 0) {
+            value = 0;
+          }
+
+          if (value > 2400) {
+            value = 2400;
+          }
+
+          id(cmd_input_limit) = value;
+
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              return id(solarflow_ready);
+
+
+          then:
+
+            - ble_client.ble_write:
+
+                id: solarflow_ble
+
+                service_uuid: "A002"
+
+                characteristic_uuid: "C304"
+
+                value: !lambda |-
+
+                  const int value =
+                    id(cmd_input_limit);
+
+                  const uint64_t ts =
+                    (uint64_t) millis();
+
+                  const std::string s =
+                    std::to_string(ts);
+
+
+                  const std::string tx =
+
+                    "{\"method\":\"write\","
+                    "\"timestamp\":" + s + ","
+                    "\"messageId\":\"" + s + "\","
+                    "\"properties\":{\"inputLimit\":"
+                    + std::to_string(value)
+                    + "}}";
+
+
+                  ESP_LOGI(
+                    "solarflow_tx",
+                    "INPUT LIMIT -> %d W",
+                    value
+                  );
+
+
+                  return std::vector<uint8_t>(
+                    tx.begin(),
+                    tx.end()
+                  );
+
+
+          else:
+
+            - lambda: |-
+
+                ESP_LOGW(
+                  "solarflow_tx",
+                  "InputLimit not sent - control not ready"
+                );
+
+
+  - platform: template
+
+    id: sf_output_limit
+
+    name: "SolarFlow Output Limit"
+
+    icon: "mdi:battery-arrow-up"
+
+    unit_of_measurement: "W"
+
+    min_value: 0
+    max_value: 2400
+    step: 1
+
+    optimistic: false
+
+
+    set_action:
+
+      - lambda: |-
+
+          int value = (int) x;
+
+          if (value < 0) {
+            value = 0;
+          }
+
+          if (value > 2400) {
+            value = 2400;
+          }
+
+          id(cmd_output_limit) = value;
+
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              return id(solarflow_ready);
+
+
+          then:
+
+            - ble_client.ble_write:
+
+                id: solarflow_ble
+
+                service_uuid: "A002"
+
+                characteristic_uuid: "C304"
+
+                value: !lambda |-
+
+                  const int value =
+                    id(cmd_output_limit);
+
+                  const uint64_t ts =
+                    (uint64_t) millis();
+
+                  const std::string s =
+                    std::to_string(ts);
+
+
+                  const std::string tx =
+
+                    "{\"method\":\"write\","
+                    "\"timestamp\":" + s + ","
+                    "\"messageId\":\"" + s + "\","
+                    "\"properties\":{\"outputLimit\":"
+                    + std::to_string(value)
+                    + "}}";
+
+
+                  ESP_LOGI(
+                    "solarflow_tx",
+                    "OUTPUT LIMIT -> %d W",
+                    value
+                  );
+
+
+                  return std::vector<uint8_t>(
+                    tx.begin(),
+                    tx.end()
+                  );
+
+
+          else:
+
+            - lambda: |-
+
+                ESP_LOGW(
+                  "solarflow_tx",
+                  "OutputLimit not sent - control not ready"
+                );
+
+
+  - platform: template
+
+    id: sf_ac_mode_control
+
+    name: "SolarFlow AC Mode Target"
+
+    icon: "mdi:swap-horizontal"
+
+    min_value: 1
+    max_value: 2
+    step: 1
+
+    optimistic: false
+
+
+    set_action:
+
+      - lambda: |-
+
+          int value = (int) x;
+
+          if (
+            value == 1
+            ||
+            value == 2
+          ) {
+
+            id(cmd_ac_mode) = value;
+          }
+
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              return (
+                id(solarflow_ready)
+                &&
+                (
+                  id(cmd_ac_mode) == 1
+                  ||
+                  id(cmd_ac_mode) == 2
+                )
+              );
+
+
+          then:
+
+            - ble_client.ble_write:
+
+                id: solarflow_ble
+
+                service_uuid: "A002"
+
+                characteristic_uuid: "C304"
+
+                value: !lambda |-
+
+                  const int value =
+                    id(cmd_ac_mode);
+
+                  const uint64_t ts =
+                    (uint64_t) millis();
+
+                  const std::string s =
+                    std::to_string(ts);
+
+
+                  const std::string tx =
+
+                    "{\"method\":\"write\","
+                    "\"timestamp\":" + s + ","
+                    "\"messageId\":\"" + s + "\","
+                    "\"properties\":{\"acMode\":"
+                    + std::to_string(value)
+                    + "}}";
+
+
+                  ESP_LOGI(
+                    "solarflow_tx",
+                    "AC MODE -> %d (%s)",
+                    value,
+                    value == 1
+                      ? "CHARGING"
+                      : "DISCHARGING"
+                  );
+
+
+                  return std::vector<uint8_t>(
+                    tx.begin(),
+                    tx.end()
+                  );
+
+
+          else:
+
+            - lambda: |-
+
+                ESP_LOGW(
+                  "solarflow_tx",
+                  "AC mode not sent - control not ready"
+                );
+
+
+  - platform: template
+
+    id: sf_max_soc
+
+    name: "SolarFlow Max SOC"
+
+    icon: "mdi:battery-arrow-up"
+
+    unit_of_measurement: "%"
+
+    min_value: 70
+    max_value: 100
+    step: 1
+
+    optimistic: false
+
+    lambda: |-
+
+      return {};
+
+    update_interval: never
+
+
+    set_action:
+
+      - lambda: |-
+
+          int pct =
+            (int) (x + 0.5f);
+
+          if (
+            pct < 70
+          ) {
+            pct = 70;
+          }
+
+          if (
+            pct > 100
+          ) {
+            pct = 100;
+          }
+
+          id(cmd_max_soc_raw) =
+            pct * 10;
+
+          ESP_LOGI(
+            "solarflow_soc",
+            "Max SOC target=%d%% -> socSet=%d",
+            pct,
+            id(cmd_max_soc_raw)
+          );
+
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              return (
+                id(solarflow_ready)
+                &&
+                id(cmd_max_soc_raw) >= 700
+                &&
+                id(cmd_max_soc_raw) <= 1000
+              );
+
+
+          then:
+
+            - ble_client.ble_write:
+
+                id: solarflow_ble
+
+                service_uuid: "A002"
+
+                characteristic_uuid: "C304"
+
+                value: !lambda |-
+
+                  const int raw =
+                    id(cmd_max_soc_raw);
+
+                  const uint64_t ts =
+                    (uint64_t) millis();
+
+                  const std::string s =
+                    std::to_string(ts);
+
+                  const std::string tx =
+
+                    "{\"method\":\"write\","
+                    "\"timestamp\":" + s + ","
+                    "\"messageId\":\"" + s + "\","
+                    "\"properties\":{\"socSet\":"
+                    + std::to_string(raw)
+                    + "}}";
+
+                  ESP_LOGI(
+                    "solarflow_soc",
+                    "TX socSet=%d -> %.1f%%",
+                    raw,
+                    ((float) raw) / 10.0f
+                  );
+
+                  return std::vector<uint8_t>(
+                    tx.begin(),
+                    tx.end()
+                  );
+
+
+          else:
+
+            - lambda: |-
+
+                ESP_LOGW(
+                  "solarflow_soc",
+                  "Max SOC not sent - control not ready"
+                );
+
+
+  - platform: template
+
+    id: sf_min_soc
+
+    name: "SolarFlow Min SOC"
+
+    icon: "mdi:battery-arrow-down"
+
+    unit_of_measurement: "%"
+
+    min_value: 0
+    max_value: 50
+    step: 1
+
+    optimistic: false
+
+    lambda: |-
+
+      return {};
+
+    update_interval: never
+
+
+    set_action:
+
+      - lambda: |-
+
+          int pct =
+            (int) (x + 0.5f);
+
+          if (
+            pct < 0
+          ) {
+            pct = 0;
+          }
+
+          if (
+            pct > 50
+          ) {
+            pct = 50;
+          }
+
+          id(cmd_min_soc_raw) =
+            pct * 10;
+
+          ESP_LOGI(
+            "solarflow_soc",
+            "Min SOC target=%d%% -> minSoc=%d",
+            pct,
+            id(cmd_min_soc_raw)
+          );
+
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              return (
+                id(solarflow_ready)
+                &&
+                id(cmd_min_soc_raw) >= 0
+                &&
+                id(cmd_min_soc_raw) <= 500
+              );
+
+
+          then:
+
+            - ble_client.ble_write:
+
+                id: solarflow_ble
+
+                service_uuid: "A002"
+
+                characteristic_uuid: "C304"
+
+                value: !lambda |-
+
+                  const int raw =
+                    id(cmd_min_soc_raw);
+
+                  const uint64_t ts =
+                    (uint64_t) millis();
+
+                  const std::string s =
+                    std::to_string(ts);
+
+                  const std::string tx =
+
+                    "{\"method\":\"write\","
+                    "\"timestamp\":" + s + ","
+                    "\"messageId\":\"" + s + "\","
+                    "\"properties\":{\"minSoc\":"
+                    + std::to_string(raw)
+                    + "}}";
+
+                  ESP_LOGI(
+                    "solarflow_soc",
+                    "TX minSoc=%d -> %.1f%%",
+                    raw,
+                    ((float) raw) / 10.0f
+                  );
+
+                  return std::vector<uint8_t>(
+                    tx.begin(),
+                    tx.end()
+                  );
+
+
+          else:
+
+            - lambda: |-
+
+                ESP_LOGW(
+                  "solarflow_soc",
+                  "Min SOC not sent - control not ready"
+                );
+
+sensor:
+
+
+  - platform: template
+
+    id: sf_battery_power
+
+    name: "SolarFlow Battery Power"
+
+    icon: "mdi:battery-sync"
+
+    unit_of_measurement: "W"
+
+    accuracy_decimals: 0
+
+    force_update: true
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_pack_input_power
+
+    name: "SolarFlow Pack Input Power"
+
+    icon: "mdi:battery-arrow-down"
+
+    unit_of_measurement: "W"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_output_pack_power
+
+    name: "SolarFlow Output Pack Power"
+
+    icon: "mdi:battery-arrow-up"
+
+    unit_of_measurement: "W"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_soc
+
+    name: "SolarFlow Battery SOC"
+
+    icon: "mdi:battery"
+
+    unit_of_measurement: "%"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_pack_state
+
+    name: "SolarFlow Pack State"
+
+    icon: "mdi:battery-sync"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_ac_status
+
+    name: "SolarFlow AC Status"
+
+    icon: "mdi:current-ac"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_ac_mode_actual
+
+    name: "SolarFlow AC Mode Actual"
+
+    icon: "mdi:swap-horizontal"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_grid_state
+
+    name: "SolarFlow Grid State"
+
+    icon: "mdi:transmission-tower"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_fault_level
+
+    name: "SolarFlow Fault Level"
+
+    icon: "mdi:alert-circle-outline"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_smart_mode
+
+    name: "SolarFlow Smart Mode"
+
+    icon: "mdi:brain"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_charge_max_limit
+
+    name: "SolarFlow Charge Max Limit"
+
+    icon: "mdi:battery-charging-high"
+
+    unit_of_measurement: "W"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_soc_limit
+
+    name: "SolarFlow SOC Limit"
+
+    icon: "mdi:battery-alert"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_disconnect_count
+
+    name: "SolarFlow BLE Disconnects"
+
+    icon: "mdi:bluetooth-off"
+
+    accuracy_decimals: 0
+
+    update_interval: never
+
+  - platform: wifi_signal
+
+    name: "SolarFlow Wi-Fi Signal"
+
+    update_interval: 60s
+
+    icon: "mdi:access-point"
+
+
+text_sensor:
+
+  - platform: wifi_info
+
+    ssid:
+      id: sf_wifi_ssid
+      name: "SolarFlow Wi-Fi SSID"
+      icon: "mdi:wifi"
+
+    bssid:
+      id: sf_wifi_bssid
+      name: "SolarFlow Wi-Fi BSSID"
+      icon: "mdi:access-point"
+
+    ip_address:
+      id: sf_wifi_ip
+      name: "SolarFlow Wi-Fi IP"
+      icon: "mdi:ip-network"
+
+
+  - platform: template
+    id: sf_selected_mac_text
+    name: "SolarFlow BLE Selected MAC"
+    icon: "mdi:bluetooth-connect"
+    update_interval: never
+
+  - platform: template
+    id: sf_scan_result_1
+    name: "SolarFlow BLE Result 1"
+    icon: "mdi:bluetooth"
+    update_interval: never
+
+  - platform: template
+    id: sf_scan_result_2
+    name: "SolarFlow BLE Result 2"
+    icon: "mdi:bluetooth"
+    update_interval: never
+
+  - platform: template
+    id: sf_scan_result_3
+    name: "SolarFlow BLE Result 3"
+    icon: "mdi:bluetooth"
+    update_interval: never
+
+  - platform: template
+    id: sf_scan_result_4
+    name: "SolarFlow BLE Result 4"
+    icon: "mdi:bluetooth"
+    update_interval: never
+
+  - platform: template
+    id: sf_scan_result_5
+    name: "SolarFlow BLE Result 5"
+    icon: "mdi:bluetooth"
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_ac_mode_text
+
+    name: "SolarFlow AC Direction"
+
+    icon: "mdi:swap-horizontal"
+
+    update_interval: never
+
+
+  - platform: template
+
+    id: sf_pack_state_text
+
+    name: "SolarFlow Battery Status"
+
+    icon: "mdi:battery-sync"
+
+    update_interval: never
+
+
+  - platform: ble_client
+
+    ble_client_id: solarflow_ble
+
+    id: solarflow_ble_notify
+
+    name: "SolarFlow BLE Notify"
+
+    internal: true
+
+    service_uuid: "A002"
+
+    characteristic_uuid: "C305"
+
+    notify: true
+
+    update_interval: never
+
+
+    on_notify:
+      then:
+
+        - lambda: |-
+
+            id(solarflow_smartmode_seen_packet) =
+              false;
+
+
+            auto get_int =
+              [&](const char *key, int &value) -> bool {
+
+                std::string needle =
+                  "\"";
+
+                needle += key;
+                needle += "\":";
+
+
+                size_t pos =
+                  x.find(needle);
+
+
+                if (
+                  pos == std::string::npos
+                ) {
+
+                  return false;
+                }
+
+
+                pos +=
+                  needle.length();
+
+
+                while (
+                  pos < x.length()
+                  &&
+                  (
+                    x[pos] == ' '
+                    ||
+                    x[pos] == '\t'
+                  )
+                ) {
+
+                  pos++;
+                }
+
+
+                if (
+                  pos >= x.length()
+                ) {
+
+                  return false;
+                }
+
+
+                bool negative =
+                  false;
+
+
+                if (
+                  x[pos] == '-'
+                ) {
+
+                  negative =
+                    true;
+
+                  pos++;
+                }
+
+
+                if (
+                  pos >= x.length()
+                  ||
+                  x[pos] < '0'
+                  ||
+                  x[pos] > '9'
+                ) {
+
+                  return false;
+                }
+
+
+                long result =
+                  0;
+
+
+                while (
+                  pos < x.length()
+                  &&
+                  x[pos] >= '0'
+                  &&
+                  x[pos] <= '9'
+                ) {
+
+                  result =
+                    result * 10
+                    +
+                    (x[pos] - '0');
+
+                  pos++;
+                }
+
+
+                if (
+                  negative
+                ) {
+
+                  result =
+                    -result;
+                }
+
+
+                value =
+                  (int) result;
+
+
+                return true;
+              };
+
+
+            int value;
+
+            bool power_changed =
+              false;
+
+
+            if (
+              get_int(
+                "packInputPower",
+                value
+              )
+            ) {
+
+              id(sf_pack_input_power_raw) =
+                value;
+
+
+              id(sf_output_pack_power).publish_state(
+                value
+              );
+
+              power_changed =
+                true;
+            }
+
+
+            if (
+              get_int(
+                "outputPackPower",
+                value
+              )
+            ) {
+
+              id(sf_output_pack_power_raw) =
+                value;
+
+
+              id(sf_pack_input_power).publish_state(
+                value
+              );
+
+              power_changed =
+                true;
+            }
+
+
+            if (
+              power_changed
+            ) {
+
+
+              const int battery_power =
+
+                id(sf_output_pack_power_raw)
+                -
+                id(sf_pack_input_power_raw);
+
+
+              id(sf_battery_power).publish_state(
+                battery_power
+              );
+
+
+              ESP_LOGI(
+                "solarflow_power",
+                "BLE packInput=%dW outputPack=%dW -> Input=%dW Output=%dW -> battery_power=%dW",
+                id(sf_pack_input_power_raw),
+                id(sf_output_pack_power_raw),
+                id(sf_output_pack_power_raw),
+                id(sf_pack_input_power_raw),
+                battery_power
+              );
+            }
+
+
+            if (
+              get_int(
+                "acMode",
+                value
+              )
+            ) {
+
+              id(cmd_ac_mode) =
+                value;
+
+              id(sf_ac_mode_actual).publish_state(
+                value
+              );
+
+              id(sf_ac_mode_control).publish_state(
+                value
+              );
+
+
+              if (
+                value == 1
+              ) {
+
+                id(sf_ac_mode_text).publish_state(
+                  "Charging"
+                );
+              }
+
+              else if (
+                value == 2
+              ) {
+
+                id(sf_ac_mode_text).publish_state(
+                  "Discharging"
+                );
+              }
+
+              else {
+
+                id(sf_ac_mode_text).publish_state(
+                  "Unknown"
+                );
+              }
+            }
+
+
+            if (
+              get_int(
+                "inputLimit",
+                value
+              )
+            ) {
+
+              id(cmd_input_limit) =
+                value;
+
+              id(sf_input_limit).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "outputLimit",
+                value
+              )
+            ) {
+
+              id(cmd_output_limit) =
+                value;
+
+              id(sf_output_limit).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "packState",
+                value
+              )
+            ) {
+
+              id(sf_pack_state).publish_state(
+                value
+              );
+
+
+              if (
+                value == 0
+              ) {
+
+                id(sf_pack_state_text).publish_state(
+                  "Standby"
+                );
+              }
+
+              else if (
+                value == 1
+              ) {
+
+                id(sf_pack_state_text).publish_state(
+                  "Charging"
+                );
+              }
+
+              else if (
+                value == 2
+              ) {
+
+                id(sf_pack_state_text).publish_state(
+                  "Discharging"
+                );
+              }
+
+              else {
+
+                id(sf_pack_state_text).publish_state(
+                  "Unknown"
+                );
+              }
+            }
+
+
+            if (
+              get_int(
+                "acStatus",
+                value
+              )
+            ) {
+
+              id(sf_ac_status).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "electricLevel",
+                value
+              )
+            ) {
+
+              id(sf_soc).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "gridState",
+                value
+              )
+            ) {
+
+              id(sf_grid_state).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "faultLevel",
+                value
+              )
+            ) {
+
+              id(sf_fault_level).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "smartMode",
+                value
+              )
+            ) {
+
+              id(solarflow_smartmode_seen_packet) =
+                true;
+
+              id(solarflow_smart_mode_value) =
+                value;
+
+              id(sf_smart_mode).publish_state(
+                value
+              );
+
+
+              if (
+                value == 1
+              ) {
+
+                id(sf_smart_mode_ok).publish_state(
+                  true
+                );
+
+
+                if (
+                  id(solarflow_protocol_ready)
+                  &&
+                  id(solarflow_ble_is_connected)
+                ) {
+
+                  id(solarflow_ready) =
+                    true;
+
+                  id(sf_ble_ready).publish_state(
+                    true
+                  );
+                }
+
+
+                ESP_LOGI(
+                  "solarflow_smartmode",
+                  "smartMode=1 -> OK"
+                );
+              }
+
+              else {
+
+                id(solarflow_ready) =
+                  false;
+
+                id(sf_ble_ready).publish_state(
+                  false
+                );
+
+                id(sf_smart_mode_ok).publish_state(
+                  false
+                );
+
+
+                ESP_LOGW(
+                  "solarflow_smartmode",
+                  "smartMode=%d -> target is 1",
+                  value
+                );
+              }
+            }
+
+
+            if (
+              get_int(
+                "chargeMaxLimit",
+                value
+              )
+            ) {
+
+              id(sf_charge_max_limit).publish_state(
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "socLimit",
+                value
+              )
+            ) {
+
+              id(sf_soc_limit).publish_state(
+                value
+              );
+
+              ESP_LOGI(
+                "solarflow_soc",
+                "socLimit=%d",
+                value
+              );
+            }
+
+
+            if (
+              get_int(
+                "socSet",
+                value
+              )
+            ) {
+
+              id(cmd_max_soc_raw) =
+                value;
+
+              const float max_soc =
+                ((float) value) / 10.0f;
+
+              id(sf_max_soc).publish_state(
+                max_soc
+              );
+
+              ESP_LOGI(
+                "solarflow_soc",
+                "socSet=%d -> Max SOC=%.1f%%",
+                value,
+                max_soc
+              );
+            }
+
+
+            if (
+              get_int(
+                "minSoc",
+                value
+              )
+            ) {
+
+              id(cmd_min_soc_raw) =
+                value;
+
+              const float min_soc =
+                ((float) value) / 10.0f;
+
+              id(sf_min_soc).publish_state(
+                min_soc
+              );
+
+              ESP_LOGI(
+                "solarflow_soc",
+                "minSoc=%d -> Min SOC=%.1f%%",
+                value,
+                min_soc
+              );
+            }
+
+
+            int ac_mode;
+
+
+            if (
+              get_int(
+                "acMode",
+                ac_mode
+              )
+            ) {
+
+              int input_limit =
+                -1;
+
+              int output_limit =
+                -1;
+
+
+              get_int(
+                "inputLimit",
+                input_limit
+              );
+
+              get_int(
+                "outputLimit",
+                output_limit
+              );
+
+
+              ESP_LOGI(
+                "solarflow_state",
+                "acMode=%d inputLimit=%dW outputLimit=%dW",
+                ac_mode,
+                input_limit,
+                output_limit
+              );
+            }
+
+
+            if (
+              x.find(
+                "\"method\":\"error\""
+              )
+              !=
+              std::string::npos
+            ) {
+
+              ESP_LOGW(
+                "solarflow_error",
+                "%s",
+                x.c_str()
+              );
+            }
+
+
+        - if:
+
+            condition:
+
+              lambda: |-
+
+                return (
+                  id(
+                    solarflow_keepalive_waiting_reply
+                  )
+                  &&
+                  x.find(
+                    "\"method\":\"getInfo-rsp\""
+                  )
+                  !=
+                  std::string::npos
+                );
+
+
+            then:
+
+              - lambda: |-
+
+                  id(
+                    solarflow_keepalive_waiting_reply
+                  ) = false;
+
+                  ESP_LOGI(
+                    "solarflow_keepalive",
+                    "KEEPALIVE OK - getInfo-rsp received"
+                  );
+
+                  ESP_LOGI(
+                    "solarflow_keepalive",
+                    "============================================"
+                  );
+
+
+        - if:
+
+            condition:
+
+              lambda: |-
+
+                if (
+                  !id(
+                    solarflow_smartmode_seen_packet
+                  )
+                ) {
+
+                  return false;
+                }
+
+
+                if (
+                  !id(
+                    solarflow_protocol_ready
+                  )
+                ) {
+
+                  return false;
+                }
+
+
+                if (
+                  !id(
+                    solarflow_ble_is_connected
+                  )
+                ) {
+
+                  return false;
+                }
+
+
+                if (
+                  id(
+                    solarflow_smart_mode_value
+                  )
+                  ==
+                  1
+                ) {
+
+                  return false;
+                }
+
+
+                if (
+                  id(
+                    solarflow_smartmode_write_pending
+                  )
+                ) {
+
+                  return false;
+                }
+
+
+                const uint32_t now =
+                  millis();
+
+
+                const uint32_t last =
+                  id(
+                    solarflow_smartmode_last_write_ms
+                  );
+
+
+                if (
+                  last != 0
+                  &&
+                  (uint32_t) (now - last)
+                  <
+                  10000
+                ) {
+
+                  return false;
+                }
+
+
+                return true;
+
+
+            then:
+
+              - lambda: |-
+
+                  id(
+                    solarflow_smartmode_write_pending
+                  ) = true;
+
+
+                  id(
+                    solarflow_smartmode_last_write_ms
+                  ) = millis();
+
+
+                  ESP_LOGW(
+                    "solarflow_smartmode",
+                    "smartMode is %d -> automatically setting to 1",
+                    id(solarflow_smart_mode_value)
+                  );
+
+
+              - delay: 750ms
+
+
+              - if:
+
+                  condition:
+
+                    lambda: |-
+
+                      return (
+                        id(
+                          solarflow_protocol_ready
+                        )
+                        &&
+                        id(
+                          solarflow_ble_is_connected
+                        )
+                        &&
+                        id(
+                          solarflow_smart_mode_value
+                        )
+                        !=
+                        1
+                      );
+
+
+                  then:
+
+                    - ble_client.ble_write:
+
+                        id: solarflow_ble
+
+                        service_uuid: "A002"
+
+                        characteristic_uuid: "C304"
+
+                        value: !lambda |-
+
+                          const uint64_t ts =
+                            (uint64_t) millis();
+
+                          const std::string s =
+                            std::to_string(ts);
+
+
+                          const std::string tx =
+
+                            "{\"method\":\"write\","
+                            "\"timestamp\":" + s + ","
+                            "\"messageId\":\"" + s + "\","
+                            "\"properties\":{\"smartMode\":1}}";
+
+
+                          ESP_LOGI(
+                            "solarflow_smartmode",
+                            "TX smartMode -> 1"
+                          );
+
+
+                          return std::vector<uint8_t>(
+                            tx.begin(),
+                            tx.end()
+                          );
+
+
+              - delay: 500ms
+
+
+              - lambda: |-
+
+                  id(
+                    solarflow_smartmode_write_pending
+                  ) = false;
+
+
+        - if:
+
+            condition:
+
+              lambda: |-
+
+                return (
+                  !id(
+                    solarflow_handshake_done
+                  )
+                  &&
+                  x.find(
+                    "\"method\":\"BLESPP\""
+                  )
+                  !=
+                  std::string::npos
+                );
+
+
+            then:
+
+              - lambda: |-
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "BLESPP detected -> sending BLESPP_OK"
+                  );
+
+
+              - ble_client.ble_write:
+
+                  id: solarflow_ble
+
+                  service_uuid: "A002"
+
+                  characteristic_uuid: "C304"
+
+                  value: !lambda |-
+
+                    const std::string tx =
+
+                      "{\"messageId\":\"1009\","
+                      "\"method\":\"BLESPP_OK\"}";
+
+
+                    return std::vector<uint8_t>(
+                      tx.begin(),
+                      tx.end()
+                    );
+
+
+              - lambda: |-
+
+                  id(
+                    solarflow_handshake_done
+                  ) = true;
+
+
+                  ESP_LOGI(
+                    "solarflow",
+                    "BLESPP_OK completed"
+                  );
+
+
+              - delay: 500ms
+
+
+              - if:
+
+                  condition:
+
+                    lambda: |-
+
+                      return (
+                        id(
+                          solarflow_ble_is_connected
+                        )
+                        &&
+                        !id(
+                          solarflow_getinfo_sent
+                        )
+                      );
+
+
+                  then:
+
+                    - ble_client.ble_write:
+
+                        id: solarflow_ble
+
+                        service_uuid: "A002"
+
+                        characteristic_uuid: "C304"
+
+                        value: !lambda |-
+
+                          const uint64_t ts =
+                            (uint64_t) millis();
+
+
+                          const std::string s =
+                            std::to_string(ts);
+
+
+                          const std::string tx =
+
+                            "{\"messageId\":\""
+                            + s
+                            + "\","
+                            "\"method\":\"getInfo\","
+                            "\"timestamp\":"
+                            + s
+                            + "}";
+
+
+                          ESP_LOGI(
+                            "solarflow",
+                            "Sending initial getInfo"
+                          );
+
+
+                          return std::vector<uint8_t>(
+                            tx.begin(),
+                            tx.end()
+                          );
+
+
+                    - lambda: |-
+
+                        id(
+                          solarflow_getinfo_sent
+                        ) = true;
+
+
+        - if:
+
+            condition:
+
+              lambda: |-
+
+                return (
+                  x.find(
+                    "\"method\":\"getInfo-rsp\""
+                  )
+                  !=
+                  std::string::npos
+                );
+
+
+            then:
+
+              - lambda: |-
+
+                  id(
+                    solarflow_protocol_ready
+                  ) = true;
+
+
+              - if:
+
+                  condition:
+
+                    lambda: |-
+
+                      return (
+                        id(
+                          solarflow_ble_is_connected
+                        )
+                        &&
+                        !id(
+                          solarflow_getall_sent
+                        )
+                      );
+
+
+                  then:
+
+                    - lambda: |-
+
+                        ESP_LOGI(
+                          "solarflow",
+                          "BLESPP protocol ready"
+                        );
+
+
+                    - delay: 300ms
+
+
+                    - ble_client.ble_write:
+
+                        id: solarflow_ble
+
+                        service_uuid: "A002"
+
+                        characteristic_uuid: "C304"
+
+                        value: !lambda |-
+
+                          const uint64_t ts =
+                            (uint64_t) millis();
+
+
+                          const std::string s =
+                            std::to_string(ts);
+
+
+                          const std::string tx =
+
+                            "{\"messageId\":\"11\","
+                            "\"timestamp\":"
+                            + s
+                            + ","
+                            "\"properties\":[\"getAll\"],"
+                            "\"method\":\"read\"}";
+
+
+                          ESP_LOGI(
+                            "solarflow",
+                            "Sending initial getAll"
+                          );
+
+
+                          return std::vector<uint8_t>(
+                            tx.begin(),
+                            tx.end()
+                          );
+
+
+                    - lambda: |-
+
+                        id(
+                          solarflow_getall_sent
+                        ) = true;
+
+
+                        ESP_LOGI(
+                          "solarflow_keepalive",
+                          "Initialization complete - first keepalive in 60 s"
+                        );
+
+
+                    - script.execute:
+                        id: solarflow_keepalive_loop
+
+
+interval:
+
+  - interval: 5s
+
+    then:
+
+      - if:
+
+          condition:
+
+            lambda: |-
+
+              static uint8_t connecting_ticks = 0;
+
+              if (
+                id(solarflow_mode_change_active)
+                ||
+                id(solarflow_ble_mode) != 1
+                ||
+                id(solarflow_selected_mac) == 0
+              ) {
+
+                connecting_ticks = 0;
+                return false;
+              }
+
+              if (
+                id(solarflow_ble).state()
+                ==
+                esphome::esp32_ble_tracker::ClientState::CONNECTING
+              ) {
+
+                if (connecting_ticks < 6) {
+                  connecting_ticks++;
+                }
+
+                if (connecting_ticks >= 6) {
+
+                  connecting_ticks = 0;
+
+                  return true;
+                }
+
+                return false;
+              }
+
+              connecting_ticks = 0;
+
+              return false;
+
+
+          then:
+
+            - lambda: |-
+
+                id(solarflow_mode_change_active) = true;
+
+                id(solarflow_ble).set_auto_connect(false);
+
+                id(solarflow_ble_is_connected) = false;
+
+                id(solarflow_handshake_done) = false;
+                id(solarflow_getinfo_sent) = false;
+                id(solarflow_getall_sent) = false;
+
+                id(solarflow_protocol_ready) = false;
+                id(solarflow_ready) = false;
+
+                id(solarflow_smartmode_write_pending) = false;
+                id(solarflow_keepalive_waiting_reply) = false;
+
+                id(sf_ble_connected).publish_state(false);
+                id(sf_ble_ready).publish_state(false);
+                id(sf_smart_mode_ok).publish_state(false);
+
+                ESP_LOGW(
+                  "solarflow_reconnect",
+                  "CONNECTING for about 30 s -> BLE stack reset"
+                );
+
+
+            - script.execute: solarflow_led_error_hold
+
+
+            - script.stop: solarflow_keepalive_loop
+
+
+            - esp32_ble_tracker.stop_scan:
+
+
+            - if:
+
+                condition:
+
+                  ble.enabled:
+
+
+                then:
+
+                  - ble.disable:
+
+
+            - delay: 2s
+
+
+            - if:
+
+                condition:
+
+                  not:
+
+                    ble.enabled:
+
+
+                then:
+
+                  - ble.enable:
+
+
+                  - wait_until:
+
+                      condition:
+
+                        ble.enabled:
+
+                      timeout: 10s
+
+
+            - wait_until:
+
+                condition:
+
+                  lambda: |-
+
+                    return (
+                      id(solarflow_ble).state()
+                      ==
+                      esphome::esp32_ble_tracker::ClientState::IDLE
+                    );
+
+                timeout: 10s
+
+
+            - if:
+
+                condition:
+
+                  lambda: |-
+
+                    return (
+                      id(solarflow_ble_mode) == 1
+                      &&
+                      id(solarflow_selected_mac) != 0
+                      &&
+                      id(solarflow_ble).state()
+                        ==
+                      esphome::esp32_ble_tracker::ClientState::IDLE
+                    );
+
+
+                then:
+
+                  - lambda: |-
+
+                      const uint64_t mac =
+                        id(solarflow_selected_mac);
+
+                      const auto addr_type =
+                        static_cast<esp_ble_addr_type_t>(
+                          id(solarflow_selected_addr_type)
+                        );
+
+                      id(solarflow_ble).set_address(mac);
+
+                      id(solarflow_ble).set_remote_addr_type(
+                        addr_type
+                      );
+
+                      id(solarflow_ble).set_auto_connect(true);
+
+                      id(solarflow_mode_change_active) = false;
+
+                      ESP_LOGW(
+                        "solarflow_reconnect",
+                        "BLE stack restarted -> reconnecting MAC=%s",
+                        id(solarflow_ble).address_str()
+                      );
+
+
+                  - esp32_ble_tracker.start_scan:
+                      continuous: true
+
+
+                else:
+
+                  - lambda: |-
+
+                      if (id(solarflow_ble_mode) == 1) {
+                        id(solarflow_mode_change_active) = false;
+                      }
+
+                      ESP_LOGE(
+                        "solarflow_reconnect",
+                        "BLE stack reset completed, but client is not IDLE"
+                      );
+
+
+          else:
+
+            - if:
+
+                condition:
+
+                  lambda: |-
+
+                    return (
+                      !id(solarflow_mode_change_active)
+                      &&
+                      id(solarflow_ble_mode) == 1
+                      &&
+                      id(solarflow_selected_mac) != 0
+                      &&
+                      id(solarflow_ble).state()
+                        ==
+                      esphome::esp32_ble_tracker::ClientState::IDLE
+                    );
+
+
+                then:
+
+                  - if:
+
+                      condition:
+
+                        not:
+
+                          ble.enabled:
+
+
+                      then:
+
+                        - ble.enable:
+
+
+                        - wait_until:
+
+                            condition:
+
+                              ble.enabled:
+
+                            timeout: 10s
+
+
+                  - if:
+
+                      condition:
+
+                        ble.enabled:
+
+
+                      then:
+
+                        - lambda: |-
+
+                            const uint64_t mac =
+                              id(solarflow_selected_mac);
+
+                            const auto addr_type =
+                              static_cast<esp_ble_addr_type_t>(
+                                id(solarflow_selected_addr_type)
+                              );
+
+                            id(solarflow_ble).set_auto_connect(false);
+
+                            id(solarflow_ble).set_address(mac);
+
+                            id(solarflow_ble).set_remote_addr_type(
+                              addr_type
+                            );
+
+                            id(solarflow_ble).set_auto_connect(true);
+
+                            ESP_LOGW(
+                              "solarflow_reconnect",
+                              "Client IDLE -> reconnecting MAC=%s",
+                              id(solarflow_ble).address_str()
+                            );
+
+
+                        - esp32_ble_tracker.start_scan:
+                            continuous: true
+
+
+script:
+
+  - id: solarflow_update_status_led
+    mode: restart
+    then:
+
+      - if:
+          condition:
+            lambda: |-
+              return id(solarflow_led_error);
+
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 40%
+                effect: "Fast Pulse"
+
+          else:
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(solarflow_led_booting);
+
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      red: 0%
+                      green: 0%
+                      blue: 100%
+                      brightness: 30%
+                      effect: none
+
+                else:
+
+                  - if:
+                      condition:
+                        not:
+                          wifi.connected:
+
+                      then:
+                        - light.turn_on:
+                            id: status_led
+                            red: 100%
+                            green: 100%
+                            blue: 0%
+                            brightness: 30%
+                            effect: "Slow Pulse"
+
+                      else:
+
+                        - if:
+                            condition:
+                              lambda: |-
+                                return id(solarflow_led_wifi_confirm);
+
+                            then:
+                              - light.turn_on:
+                                  id: status_led
+                                  red: 0%
+                                  green: 100%
+                                  blue: 35%
+                                  brightness: 30%
+                                  effect: none
+
+                            else:
+
+                              - if:
+                                  condition:
+                                    lambda: |-
+                                      return id(solarflow_ble_mode) == 0;
+
+                                  then:
+                                    - light.turn_on:
+                                        id: status_led
+                                        red: 100%
+                                        green: 0%
+                                        blue: 0%
+                                        brightness: 20%
+                                        effect: none
+
+                                  else:
+
+                                    - if:
+                                        condition:
+                                          lambda: |-
+                                            return id(solarflow_ble_mode) == 2;
+
+                                        then:
+                                          - light.turn_on:
+                                              id: status_led
+                                              red: 0%
+                                              green: 0%
+                                              blue: 100%
+                                              brightness: 30%
+                                              effect: "Slow Pulse"
+
+                                        else:
+
+                                          - if:
+                                              condition:
+                                                lambda: |-
+                                                  return id(solarflow_ready);
+
+                                              then:
+                                                - light.turn_on:
+                                                    id: status_led
+                                                    red: 0%
+                                                    green: 100%
+                                                    blue: 0%
+                                                    brightness: 30%
+                                                    effect: none
+
+                                              else:
+
+                                                - light.turn_on:
+                                                    id: status_led
+                                                    red: 0%
+                                                    green: 100%
+                                                    blue: 0%
+                                                    brightness: 30%
+                                                    effect: "Slow Pulse"
+
+
+  - id: solarflow_wifi_connected_led_hold
+    mode: restart
+    then:
+
+      - lambda: |-
+          id(solarflow_led_wifi_confirm) = true;
+
+      - script.execute: solarflow_update_status_led
+
+      - delay: 5s
+
+      - lambda: |-
+          id(solarflow_led_wifi_confirm) = false;
+
+      - script.execute: solarflow_update_status_led
+
+
+  - id: solarflow_led_error_hold
+    mode: restart
+    then:
+
+      - lambda: |-
+          id(solarflow_led_error) = true;
+
+      - script.execute: solarflow_update_status_led
+
+      - delay: 5s
+
+      - lambda: |-
+          id(solarflow_led_error) = false;
+
+      - script.execute: solarflow_update_status_led
+
+
+  - id: solarflow_apply_ble_mode
+    mode: restart
+    then:
+
+      - lambda: |-
+          id(solarflow_mode_change_active) = true;
+
+          const uint64_t mac =
+            id(solarflow_selected_mac);
+
+          if (mac == 0) {
+            id(sf_selected_mac_text).publish_state("---");
+          }
+          else {
+            char mac_text[18];
+
+            snprintf(
+              mac_text,
+              sizeof(mac_text),
+              "%02X:%02X:%02X:%02X:%02X:%02X",
+              (uint8_t) ((mac >> 40) & 0xFF),
+              (uint8_t) ((mac >> 32) & 0xFF),
+              (uint8_t) ((mac >> 24) & 0xFF),
+              (uint8_t) ((mac >> 16) & 0xFF),
+              (uint8_t) ((mac >> 8) & 0xFF),
+              (uint8_t) (mac & 0xFF)
+            );
+
+            id(sf_selected_mac_text).publish_state(mac_text);
+          }
+
+          id(solarflow_ble).set_auto_connect(false);
+
+      - script.stop: solarflow_keepalive_loop
+
+      - esp32_ble_tracker.stop_scan:
+
+      - if:
+          condition:
+            ble.enabled:
+
+          then:
+            - ble_client.disconnect: solarflow_ble
+
+
+      - if:
+          condition:
+            lambda: |-
+              return id(solarflow_ble_mode) == 0;
+
+          then:
+            - lambda: |-
+                id(solarflow_ble_is_connected) = false;
+                id(solarflow_handshake_done) = false;
+                id(solarflow_getinfo_sent) = false;
+                id(solarflow_getall_sent) = false;
+                id(solarflow_protocol_ready) = false;
+                id(solarflow_ready) = false;
+                id(solarflow_smartmode_write_pending) = false;
+                id(solarflow_keepalive_waiting_reply) = false;
+
+                id(sf_ble_connected).publish_state(false);
+                id(sf_ble_ready).publish_state(false);
+                id(sf_smart_mode_ok).publish_state(false);
+
+                ESP_LOGI(
+                  "solarflow_ble_mode",
+                  "OFF -> connection closed, scanner stopped, BLE stack remains active"
+                );
+
+
+            - lambda: |-
+                id(solarflow_mode_change_active) = false;
+
+
+      - if:
+          condition:
+            lambda: |-
+              return id(solarflow_ble_mode) != 0;
+
+          then:
+            - if:
+                condition:
+                  not:
+                    ble.enabled:
+
+                then:
+                  - ble.enable:
+
+                  - wait_until:
+                      condition:
+                        ble.enabled:
+                      timeout: 10s
+
+            - if:
+                condition:
+                  ble.enabled:
+
+                then:
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(solarflow_ble_mode) == 2;
+
+                      then:
+                        - lambda: |-
+                            id(solarflow_scan_mac_1) = 0;
+                            id(solarflow_scan_addr_type_1) = 0;
+                            id(solarflow_scan_rssi_1) = -127;
+
+                            id(solarflow_scan_mac_2) = 0;
+                            id(solarflow_scan_addr_type_2) = 0;
+                            id(solarflow_scan_rssi_2) = -127;
+
+                            id(solarflow_scan_mac_3) = 0;
+                            id(solarflow_scan_addr_type_3) = 0;
+                            id(solarflow_scan_rssi_3) = -127;
+
+                            id(solarflow_scan_mac_4) = 0;
+                            id(solarflow_scan_addr_type_4) = 0;
+                            id(solarflow_scan_rssi_4) = -127;
+
+                            id(solarflow_scan_mac_5) = 0;
+                            id(solarflow_scan_addr_type_5) = 0;
+                            id(solarflow_scan_rssi_5) = -127;
+
+                            id(sf_ble_device_select).publish_state(
+                              "No selection"
+                            );
+
+                            id(sf_scan_result_1).publish_state("---");
+                            id(sf_scan_result_2).publish_state("---");
+                            id(sf_scan_result_3).publish_state("---");
+                            id(sf_scan_result_4).publish_state("---");
+                            id(sf_scan_result_5).publish_state("---");
+
+                            ESP_LOGI(
+                              "solarflow_ble_mode",
+                              "SCAN -> result list cleared, scan starting"
+                            );
+
+                        - esp32_ble_tracker.start_scan:
+                            continuous: true
+
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(solarflow_ble_mode) == 1;
+
+                      then:
+                        - if:
+                            condition:
+                              lambda: |-
+                                return (
+                                  id(solarflow_selected_mac) != 0
+                                );
+
+                            then:
+                              - lambda: |-
+                                  const uint64_t mac =
+                                    id(solarflow_selected_mac);
+
+                                  const auto addr_type =
+                                    static_cast<esp_ble_addr_type_t>(
+                                      id(solarflow_selected_addr_type)
+                                    );
+
+                                  id(solarflow_ble).set_address(mac);
+                                  id(solarflow_ble).set_remote_addr_type(
+                                    addr_type
+                                  );
+                                  id(solarflow_ble).set_auto_connect(true);
+
+                                  ESP_LOGI(
+                                    "solarflow_ble_mode",
+                                    "ON -> selected MAC=%s",
+                                    id(solarflow_ble).address_str()
+                                  );
+
+                              - esp32_ble_tracker.start_scan:
+                                  continuous: true
+
+                            else:
+                              - lambda: |-
+                                  ESP_LOGW(
+                                    "solarflow_ble_mode",
+                                    "ON -> no MAC selected; not connecting"
+                                  );
+
+                else:
+                  - lambda: |-
+                      ESP_LOGE(
+                        "solarflow_ble_mode",
+                        "BLE could not be enabled within 10 s"
+                      );
+
+                      id(solarflow_led_error_hold).execute();
+
+            - lambda: |-
+                id(solarflow_mode_change_active) = false;
+
+
+  - id: solarflow_keepalive_loop
+
+    mode: restart
+
+    then:
+
+      - while:
+
+          condition:
+
+            lambda: |-
+
+              return (
+                id(
+                  solarflow_ble_is_connected
+                )
+                &&
+                id(
+                  solarflow_handshake_done
+                )
+                &&
+                id(
+                  solarflow_protocol_ready
+                )
+              );
+
+
+          then:
+
+            - delay: 60s
+
+
+            - if:
+
+                condition:
+
+                  lambda: |-
+
+                    return (
+                      id(
+                        solarflow_ble_is_connected
+                      )
+                      &&
+                      id(
+                        solarflow_handshake_done
+                      )
+                      &&
+                      id(
+                        solarflow_protocol_ready
+                      )
+                    );
+
+
+                then:
+
+                  - lambda: |-
+
+                      if (
+                        id(
+                          solarflow_keepalive_waiting_reply
+                        )
+                      ) {
+
+                        ESP_LOGW(
+                          "solarflow_keepalive",
+                          "No getInfo-rsp received for the previous KEEPALIVE"
+                        );
+                      }
+
+
+                      id(
+                        solarflow_keepalive_waiting_reply
+                      ) = true;
+
+
+                      ESP_LOGI(
+                        "solarflow_keepalive",
+                        "============================================"
+                      );
+
+
+                      ESP_LOGI(
+                        "solarflow_keepalive",
+                        "KEEPALIVE START"
+                      );
+
+
+                  - ble_client.ble_write:
+
+                      id: solarflow_ble
+
+                      service_uuid: "A002"
+
+                      characteristic_uuid: "C304"
+
+                      value: !lambda |-
+
+                        const uint64_t ts =
+                          (uint64_t) millis();
+
+
+                        const std::string s =
+                          std::to_string(ts);
+
+
+                        const std::string tx =
+
+                          "{\"messageId\":\""
+                          + s
+                          + "\","
+                          "\"method\":\"getInfo\","
+                          "\"timestamp\":"
+                          + s
+                          + "}";
+
+
+                        ESP_LOGI(
+                          "solarflow_keepalive",
+                          "TX getInfo"
+                        );
+
+
+                        return std::vector<uint8_t>(
+                          tx.begin(),
+                          tx.end()
+                        );
+
+
+switch:
+
+  - platform: template
+    id: sf_wifi_reset
+    name: "SolarFlow Reset Wi-Fi"
+    icon: "mdi:wifi-cog"
+    entity_category: config
+
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+    turn_on_action:
+
+      - logger.log:
+          level: WARN
+          tag: "solarflow_wifi"
+          format: "Wi-Fi is being reset - setup mode will start"
+
+      - lambda: |-
+          wifi::global_wifi_component->save_wifi_sta(
+            "__SOLARFLOW_WIFI_SETUP__",
+            ""
+          );
+
+      - delay: 1s
+
+      - button.press: sf_restart_button
+
+
+button:
+
+  - platform: restart
+    id: sf_restart_button
+    name: "Restart SolarFlow Controller"
+
+
+light:
+
+  - platform: esp32_rmt_led_strip
+
+    id: status_led
+
+    name: "SolarFlow Status LED"
+
+    chipset: WS2812
+
+    pin: GPIO48
+
+    num_leds: 1
+
+    channel_colors: GRB
+
+    restore_mode: ALWAYS_OFF
+
+    effects:
+
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 500ms
+          update_interval: 1500ms
+          min_brightness: 5%
+          max_brightness: 30%
+
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 150ms
+          update_interval: 300ms
+          min_brightness: 0%
+          max_brightness: 40%
