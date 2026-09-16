@@ -1,1 +1,16 @@
+# ESPHome local state and build output
+.esphome/
 
+# Private credentials
+secrets.yaml
+
+# Firmware/build artifacts
+*.bin
+*.elf
+*.map
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
