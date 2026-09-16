@@ -1,0 +1,34 @@
+name: ESPHome validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tested ESPHome version
+        run: pip install "esphome==2026.8.2"
+
+      - name: Create CI-only secrets
+        run: |
+          cat > secrets.yaml <<'EOF'
+          api_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          wifi_setup_password: "ci-test-password"
+          EOF
+
+      - name: Validate configuration
+        run: esphome config solarflow_ble_controller.yaml
+
+      - name: Compile firmware
+        run: esphome compile solarflow_ble_controller.yaml
