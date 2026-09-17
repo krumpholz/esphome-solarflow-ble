@@ -1,12 +1,31 @@
-# ESPHome SolarFlow BLE Controller
+# ESPHome Zendure SolarFlow BLE Controller for Home Assistant
 
-Unofficial ESPHome BLE controller for Zendure SolarFlow devices that advertise with a `ZenHA...` Bluetooth name.
+Unofficial local **ESPHome BLE controller for Zendure SolarFlow** battery systems, built for **Home Assistant** and the **ESP32-S3**. It communicates with compatible SolarFlow devices over Bluetooth Low Energy (BLE), provides local monitoring and control, and does not require target Wi-Fi credentials to be embedded in the public firmware configuration.
+
+The controller discovers nearby Zendure SolarFlow devices whose Bluetooth name starts with `ZenHA`, lets you select a device in Home Assistant, reads SolarFlow battery state, and controls supported power, AC mode and SOC settings through ESPHome.
 
 **Release:** V2.0  
 **Tested ESPHome version:** 2026.8.2  
 **Target:** ESP32-S3 DevKitC-1, 16 MB flash, ESP-IDF
 
 > This project is not affiliated with, sponsored by, or endorsed by Zendure.
+
+## Quick Start — Import the YAML into ESPHome
+
+ESPHome Device Builder can import an existing YAML configuration directly.
+
+1. Download [`solarflow_ble_controller.yaml`](solarflow_ble_controller.yaml) from this repository.
+2. Open **ESPHome Device Builder**.
+3. Choose **Create device** and then **Import from File**.
+4. Upload `solarflow_ble_controller.yaml`.
+5. Create or update your private `secrets.yaml` using [`secrets.example.yaml`](secrets.example.yaml) as the template.
+6. Set your own `api_encryption_key` and `wifi_setup_password` values.
+7. Compile the configuration and perform the first flash to the ESP32-S3 over USB.
+8. On first boot, connect to the **SolarFlow Wi-Fi Setup** access point and use the captive portal to select your Wi-Fi network.
+9. Add the ESPHome device to Home Assistant.
+10. Set **SolarFlow Bluetooth Mode** to **Scan**, choose the desired SolarFlow device, and wait until **SolarFlow BLE Control Ready** is ON.
+
+The ESPHome Device Builder documentation describes **Import from File** as the option for uploading an existing `.yaml` or `.yml` ESPHome configuration.
 
 ## What V2.0 does
 
@@ -51,7 +70,7 @@ Not every board sold as “ESP32-S3 DevKitC-1” uses the same RGB LED pin. The 
 
 A separate always-on red power LED on many boards is hardware-wired and cannot normally be controlled by ESPHome.
 
-## Installation
+## Detailed installation
 
 1. Copy `solarflow_ble_controller.yaml` into your ESPHome configuration directory.
 2. Copy `secrets.example.yaml` to `secrets.yaml`.
