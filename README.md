@@ -4,6 +4,7 @@ Unofficial local **ESPHome BLE controller for Zendure SolarFlow** battery system
 
 The controller discovers nearby Zendure SolarFlow devices whose Bluetooth name starts with `ZenHA`, lets you select a device in Home Assistant, reads SolarFlow battery state, and controls supported power, AC mode and SOC settings through ESPHome.
 
+**Project website:** https://krumpholz.github.io/esphome-solarflow-ble/  
 **Release:** V2.0  
 **Tested ESPHome version:** 2026.8.2  
 **Target:** ESP32-S3 DevKitC-1, 16 MB flash, ESP-IDF
