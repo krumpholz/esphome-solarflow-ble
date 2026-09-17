@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://krumpholz.github.io/esphome-solarflow-ble/</loc>
+    <lastmod>2026-09-17</lastmod>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://krumpholz.github.io/esphome-solarflow-ble/PROTOCOL.html</loc>
+    <lastmod>2026-09-17</lastmod>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://krumpholz.github.io/esphome-solarflow-ble/ENTITIES.html</loc>
+    <lastmod>2026-09-17</lastmod>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://krumpholz.github.io/esphome-solarflow-ble/STATUS_LED.html</loc>
+    <lastmod>2026-09-17</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://krumpholz.github.io/esphome-solarflow-ble/TROUBLESHOOTING.html</loc>
+    <lastmod>2026-09-17</lastmod>
+    <priority>0.8</priority>
+  </url>
+</urlset>
