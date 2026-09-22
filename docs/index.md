@@ -59,6 +59,14 @@ The tested V2.0 configuration targets:
 
 V2.0 was validated and compiled with **ESPHome 2026.8.2**.
 
+## Support
+
+If this project is useful to you and you would like to support ongoing maintenance, testing and documentation, you can support it on Ko-fi:
+
+[![Support on Ko-fi](https://img.shields.io/badge/Support%20this%20project-Ko--fi-ff5f5f?logo=ko-fi&logoColor=white&style=for-the-badge)](https://ko-fi.com/krumpholzopensource)
+
+Thank you for helping keep this project freely available.
+
 ## Documentation
 
 - [BLE protocol and power mapping](PROTOCOL.md)
