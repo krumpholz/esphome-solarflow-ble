@@ -1,5 +1,7 @@
 # ESPHome Zendure SolarFlow BLE Controller for Home Assistant
 
+[Project page](https://krumpholz.github.io/esphome-solarflow-ble/) • [Release V2.0](https://github.com/krumpholz/esphome-solarflow-ble/releases/tag/V2.0) • [Support on Ko-fi](https://ko-fi.com/krumpholzopensource)
+
 Unofficial local **ESPHome BLE controller for Zendure SolarFlow** battery systems, built for **Home Assistant** and the **ESP32-S3**. It communicates with compatible SolarFlow devices over Bluetooth Low Energy (BLE), provides local monitoring and control, and does not require target Wi-Fi credentials to be embedded in the public firmware configuration.
 
 The controller discovers nearby Zendure SolarFlow devices whose Bluetooth name starts with `ZenHA`, lets you select a device in Home Assistant, reads SolarFlow battery state, and controls supported power, AC mode and SOC settings through ESPHome.
@@ -10,6 +12,14 @@ The controller discovers nearby Zendure SolarFlow devices whose Bluetooth name s
 **Target:** ESP32-S3 DevKitC-1, 16 MB flash, ESP-IDF
 
 > This project is not affiliated with, sponsored by, or endorsed by Zendure.
+
+## Support this project
+
+If this project helps you, you can support its maintenance and further development:
+
+[![Support on Ko-fi](https://img.shields.io/badge/Support-Ko--fi-ff5f5f?logo=ko-fi&logoColor=white)](https://ko-fi.com/krumpholzopensource)
+
+Your support helps maintain, test and document this project and keep it freely available.
 
 ## Quick Start — Import the YAML into ESPHome
 
