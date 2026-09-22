@@ -6,6 +6,14 @@ Die primäre Projektdokumentation ist [README.md](README.md). Diese Datei fasst 
 
 > Dieses Projekt ist nicht mit Zendure verbunden und wird weder von Zendure gesponsert noch unterstützt.
 
+## Unterstützung
+
+Wenn dir dieses Projekt hilft, kannst du die Pflege und Weiterentwicklung unterstützen:
+
+[![Support on Ko-fi](https://img.shields.io/badge/Support-Ko--fi-ff5f5f?logo=ko-fi&logoColor=white)](https://ko-fi.com/krumpholzopensource)
+
+Deine Unterstützung hilft dabei, das Projekt zu pflegen, zu testen, zu dokumentieren und frei verfügbar zu halten.
+
 ## V2.0
 
 Die getestete V2.0 sendet **keine `deviceId`** mehr. Das Zielgerät wird bereits durch die ausgewählte BLE/GATT-Verbindung bestimmt. `getAll` und alle Schreibbefehle arbeiten in dieser Releasefassung ohne gerätespezifische ID.
